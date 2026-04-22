@@ -1,0 +1,10 @@
+## Interface: 120005
+## Title: RammsHealerMana
+## Notes: Simple healer mana percentage tracker with LibEditMode support
+## Author: Ramm
+## Version: 1.1.0
+## Dependencies: LibEditMode
+## OptionalDeps: LibSharedMedia-3.0
+## SavedVariables: RammsHealerManaDB
+
+Core.lua
