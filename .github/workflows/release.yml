@@ -20,7 +20,7 @@ jobs:
           set -euo pipefail
           ver="${GITHUB_REF_NAME}"
           mkdir -p dist/RammsHealerMana
-          cp -a RammsHealerMana.toc RammsHealerMana.lua dist/RammsHealerMana/
+          cp -a RammsHealerMana.toc Core.lua dist/RammsHealerMana/
           (cd dist && zip -r "RammsHealerMana-${ver}.zip" RammsHealerMana && unzip -l "RammsHealerMana-${ver}.zip" | head -n 50)
       - name: Create GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
