@@ -1,0 +1,29 @@
+name: Build Release Zip
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build addon zip (WowUp-friendly)
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME}"
+          mkdir -p dist/RammsHealerMana
+          cp -a RammsHealerMana.toc RammsHealerMana.lua dist/RammsHealerMana/
+          (cd dist && zip -r "RammsHealerMana-${ver}.zip" RammsHealerMana && unzip -l "RammsHealerMana-${ver}.zip" | head -n 50)
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RammsHealerMana-${{ github.ref_name }}.zip
+          generate_release_notes: true
