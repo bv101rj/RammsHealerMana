@@ -246,13 +246,48 @@ end
 --
 -- Tier 1: UnitPower arithmetic (works if non-secret)
 -- Tier 2: UnitPowerPercent + CurveConstants.ScaleTo100 (secret-safe)
---   12.0.0–12.0.5: UnitPowerPercent(unit, powerType, unmodified, curve)
---   12.0.7+:        UnitPowerPercent(unit, powerType, curve)
---   The curve parameter changed position; we try both signatures.
---   Returns 0–100 as a secret; string.format("%d", secret) is
---   whitelisted and produces a secret string; SetText accepts it.
+--   The curve arg position differs between builds:
+--     Form A: UnitPowerPercent(unit, powerType, curve)
+--     Form B: UnitPowerPercent(unit, powerType, unmodified, curve)
+--   The WRONG form can still succeed but silently return 0–1
+--   instead of 0–100 (shows "1%" at full mana), and we can't
+--   inspect a secret return to detect that. So we probe with the
+--   PLAYER's own health — non-secret, comparable — to find which
+--   form actually scales, then cache it.
 -- Tier 3: Name only (bar fill shows proportion visually)
 ------------------------------------------------------------------------
+
+local pctCallForm  -- "A", "B", or nil = undetermined (retry next call)
+
+local function DeterminePctCallForm()
+    if pctCallForm then return pctCallForm end
+    if not (UnitHealthPercent and CurveConstants and CurveConstants.ScaleTo100) then
+        return nil
+    end
+
+    -- Form A probe: UnitHealthPercent(unit, curve)
+    -- Player's own health is non-secret, so the > comparison is legal.
+    -- Health is virtually never below 1.5%, so scaled output > 1.5
+    -- reliably distinguishes 0–100 from 0–1.
+    local okA, scaledA = pcall(function()
+        return UnitHealthPercent("player", CurveConstants.ScaleTo100) > 1.5
+    end)
+    if okA and scaledA then
+        pctCallForm = "A"
+        return pctCallForm
+    end
+
+    -- Form B probe: UnitHealthPercent(unit, unmodified, curve)
+    local okB, scaledB = pcall(function()
+        return UnitHealthPercent("player", true, CurveConstants.ScaleTo100) > 1.5
+    end)
+    if okB and scaledB then
+        pctCallForm = "B"
+        return pctCallForm
+    end
+
+    return nil  -- undetermined; retry on a later call
+end
 
 local function GetPctText(unit, name)
     -- Skip units that don't use mana (12.0.5+ API)
@@ -272,21 +307,24 @@ local function GetPctText(unit, name)
     end)
     if ok then return text end
 
-    -- Tier 2: UnitPowerPercent + CurveConstants.ScaleTo100 (secret-safe)
+    -- Tier 2: UnitPowerPercent with the probed, known-scaling form
     if UnitPowerPercent and CurveConstants and CurveConstants.ScaleTo100 then
-        -- 12.0.7+ signature: UnitPowerPercent(unit, powerType, curve)
-        local ok2, text2 = pcall(function()
-            local pct = UnitPowerPercent(unit, 0, CurveConstants.ScaleTo100)
-            return name .. ": " .. string.format("%d", pct) .. "%"
-        end)
-        if ok2 then return text2 end
+        local form = DeterminePctCallForm()
 
-        -- 12.0.0–12.0.5 signature: UnitPowerPercent(unit, nil, true, curve)
-        local ok3, text3 = pcall(function()
-            local pct = UnitPowerPercent(unit, nil, true, CurveConstants.ScaleTo100)
-            return name .. ": " .. string.format("%d", pct) .. "%"
-        end)
-        if ok3 then return text3 end
+        if form == "A" then
+            local ok2, text2 = pcall(function()
+                local pct = UnitPowerPercent(unit, 0, CurveConstants.ScaleTo100)
+                return name .. ": " .. string.format("%d", pct) .. "%"
+            end)
+            if ok2 then return text2 end
+        elseif form == "B" then
+            local ok3, text3 = pcall(function()
+                local pct = UnitPowerPercent(unit, 0, true, CurveConstants.ScaleTo100)
+                return name .. ": " .. string.format("%d", pct) .. "%"
+            end)
+            if ok3 then return text3 end
+        end
+        -- form == nil: probe failed, don't risk showing a wrong scale
     end
 
     -- Tier 3: name only — bar fill shows proportion
