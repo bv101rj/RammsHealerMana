@@ -349,7 +349,33 @@ end
 
 ------------------------------------------------------------------------
 -- Roster scanning
+--
+-- Midnight/retail: track assigned HEALER roles.
+-- Forever (interface 16001, mainline family, 1.60.x): there are no
+-- role assignments, so track every group member with a mana pool.
+-- Flavor is detected by build number — Forever is the only sub-100000
+-- client that can load this addon (the TOC lists no Classic flavors).
 ------------------------------------------------------------------------
+
+local IS_FOREVER = (select(4, GetBuildInfo()) or 0) < 100000
+
+local MANA_CLASSES = {  -- fallback if the power query is blocked
+    PRIEST = true, PALADIN = true, SHAMAN = true,
+    DRUID = true, MAGE = true, WARLOCK = true, HUNTER = true,
+}
+
+local function TrackUnit(unit)
+    if IS_FOREVER then
+        -- No roles on Forever: anyone with a mana pool
+        local ok, hasMana = pcall(function()
+            return UnitPowerMax(unit, 0) > 0
+        end)
+        if ok then return hasMana end
+        local _, classFile = UnitClass(unit)
+        return (classFile and MANA_CLASSES[classFile]) or false
+    end
+    return UnitGroupRolesAssigned(unit) == "HEALER"
+end
 
 local function ScanHealers()
     wipe(healerUnits)
@@ -359,7 +385,7 @@ local function ScanHealers()
             local unit = "raid" .. i
             if UnitExists(unit)
                 and not UnitIsUnit(unit, "player")
-                and UnitGroupRolesAssigned(unit) == "HEALER" then
+                and TrackUnit(unit) then
                 healerUnits[#healerUnits + 1] = unit
             end
         end
@@ -367,7 +393,7 @@ local function ScanHealers()
         for i = 1, GetNumGroupMembers() - 1 do
             local unit = "party" .. i
             if UnitExists(unit)
-                and UnitGroupRolesAssigned(unit) == "HEALER" then
+                and TrackUnit(unit) then
                 healerUnits[#healerUnits + 1] = unit
             end
         end
@@ -496,7 +522,35 @@ frame:SetScript("OnUpdate", function(_, dt)
 end)
 
 ------------------------------------------------------------------------
--- LibEditMode integration
+-- Drag fallback — used only when LibEditMode is unavailable or its
+-- setup fails, so the frame is never stuck unmovable.
+------------------------------------------------------------------------
+
+local function EnableDragFallback()
+    frame:SetMovable(true)
+    frame:EnableMouse(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", frame.StartMoving)
+    frame:SetScript("OnDragStop", function(f)
+        f:StopMovingOrSizing()
+        local point, _, _, x, y = f:GetPoint()
+        if point then
+            db.dragPosition = { point = point, x = x, y = y }
+        end
+    end)
+    local pos = db.dragPosition
+    if type(pos) == "table"
+        and type(pos.point) == "string"
+        and type(pos.x) == "number"
+        and type(pos.y) == "number" then
+        frame:ClearAllPoints()
+        frame:SetPoint(pos.point, pos.x, pos.y)
+    end
+    print("|cff00ccffRammsHealerMana|r — Edit Mode unavailable; drag the frame to move it.")
+end
+
+------------------------------------------------------------------------
+-- LibEditMode integration (embedded under Libs\LibEditMode)
 -- Field names verified against working RammsRuneforge code:
 --   kind, values, get(layoutName), set(layoutName, value)
 ------------------------------------------------------------------------
@@ -504,7 +558,7 @@ end)
 local function SetupLEM()
     LEM = LibStub and LibStub("LibEditMode", true)
     if not LEM then
-        print("|cffff6060RammsHealerMana:|r LibEditMode not found.")
+        EnableDragFallback()
         return
     end
 
@@ -740,7 +794,13 @@ frame:SetScript("OnEvent", function(_, event, ...)
         -- Initialize LibSharedMedia (optional)
         LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
 
-        SetupLEM()
+        -- If LEM setup errors (client without Edit Mode, lib failure),
+        -- fall back to a draggable frame instead of dying.
+        local okLEM = pcall(SetupLEM)
+        if not okLEM then
+            LEM = nil
+            pcall(EnableDragFallback)
+        end
         ScanHealers()
         RefreshDisplay()
 

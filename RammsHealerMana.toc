@@ -1,11 +1,12 @@
-## Interface: 120100
+## Interface: 120000, 120001, 120005, 120007, 120100, 120105, 16001
 ## Title: RammsHealerMana
-## Notes: Simple healer mana percentage tracker with LibEditMode support
+## Notes: Simple healer mana tracker with LibEditMode support
 ## Author: Ramm
-## Version: 1.1.0
-## Dependencies: LibEditMode
-## OptionalDeps: LibSharedMedia-3.0
+## Version: 1.3.0
+## OptionalDeps: LibEditMode, LibSharedMedia-3.0
 ## SavedVariables: RammsHealerManaDB
 
-Core.lua
+Libs\LibStub\LibStub.lua
+Libs\LibEditMode\embed.xml
 
+Core.lua
