@@ -60,7 +60,6 @@ local PREVIEW_DATA = {
 local db
 local healerUnits = {}
 local barPool = {}          -- reusable bar frames
-local elapsed = 0
 local LEM
 local LSM                   -- LibSharedMedia ref, set after ADDON_LOADED
 
@@ -204,13 +203,146 @@ local function IsInEditMode()
 end
 
 ------------------------------------------------------------------------
--- Bar pool — create or reuse a healer bar
+-- Update model — no OnUpdate anywhere
+--
+-- Each bar subscribes to its own unit's power events with
+-- RegisterUnitEvent, which filters C-side: the handler only runs for
+-- that healer, and only when their mana actually changes. A healer
+-- sitting at full mana costs nothing.
+--
+-- Layout work (sizes, anchors, fonts, colors, names) runs only on
+-- roster or settings changes, never per update.
+--
+-- "Update Rate" caps how often one bar may redraw. The first change
+-- draws immediately; further changes inside the window collapse into a
+-- single trailing redraw, so the final value always lands.
+------------------------------------------------------------------------
+
+local format, floor = string.format, math.floor
+
+-- issecretvalue exists only on clients with secret values (Midnight).
+-- Everywhere else nothing is ever secret.
+local IsSecret = issecretvalue or function() return false end
+
+------------------------------------------------------------------------
+-- Secret-safe percentage (Midnight)
+--
+-- UnitPowerPercent + CurveConstants.ScaleTo100. The curve argument's
+-- position differs between builds:
+--   Form A: UnitPowerPercent(unit, powerType, curve)
+--   Form B: UnitPowerPercent(unit, powerType, unmodified, curve)
+-- The wrong form can succeed yet return 0–1 instead of 0–100 ("1%" at
+-- full mana), and a secret can't be inspected to notice. So we probe
+-- with the player's own health — not secret, comparable — and cache
+-- whichever form actually scales.
+------------------------------------------------------------------------
+
+local pctForm          -- "A" or "B" once known
+local nextProbe = 0    -- if probing fails, retry at most every 5s
+
+local function ProbeA()
+    return UnitHealthPercent("player", CurveConstants.ScaleTo100) > 1.5
+end
+
+local function ProbeB()
+    return UnitHealthPercent("player", true, CurveConstants.ScaleTo100) > 1.5
+end
+
+local function PctForm()
+    if pctForm then return pctForm end
+    if not (UnitPowerPercent and UnitHealthPercent
+            and CurveConstants and CurveConstants.ScaleTo100) then
+        return nil
+    end
+    local now = GetTime()
+    if now < nextProbe then return nil end
+    nextProbe = now + 5
+    local okA, scaledA = pcall(ProbeA)
+    if okA and scaledA then pctForm = "A" return pctForm end
+    local okB, scaledB = pcall(ProbeB)
+    if okB and scaledB then pctForm = "B" return pctForm end
+    return nil
+end
+
+------------------------------------------------------------------------
+-- Draw one bar. Always called through pcall as a safety net, but the
+-- normal path throws nothing — secrets are detected, not tripped over.
+------------------------------------------------------------------------
+
+local function UpdatePower(bar)
+    local unit = bar.unit
+    if not unit then return end
+
+    local power, maxPower = UnitPower(unit, 0), UnitPowerMax(unit, 0)
+    local plain = not (IsSecret(power) or IsSecret(maxPower))
+
+    -- Fill: StatusBar accepts secrets and does the division C-side.
+    -- Max mana rarely changes, so only push it after layout or
+    -- UNIT_MAXPOWER — or, with plain numbers, when it actually differs.
+    -- (Short-circuit keeps a secret max from ever being compared.)
+    if bar.needMax or (plain and maxPower ~= bar.lastMax) then
+        bar.needMax = false
+        bar.lastMax = plain and maxPower or nil
+        bar:SetMinMaxValues(0, maxPower)
+    end
+    bar:SetValue(power)
+
+    if plain then
+        -- Plain numbers (Forever, Classic, unrestricted contexts).
+        -- Skip the redraw if the whole-number percent didn't move.
+        local pct = maxPower > 0 and floor(power / maxPower * 100 + 0.5) or 0
+        if pct ~= bar.lastPct then
+            bar.lastPct = pct
+            bar.text:SetFormattedText("%s%d%%", bar.prefix, pct)
+        end
+        return
+    end
+
+    -- Secret numbers (Midnight): string.format is whitelisted for
+    -- secrets, concatenation with a secret string is allowed, and
+    -- SetText accepts the result.
+    local form = PctForm()
+    if form == "A" then
+        bar.text:SetText(bar.prefix
+            .. format("%d%%", UnitPowerPercent(unit, 0, CurveConstants.ScaleTo100)))
+    elseif form == "B" then
+        bar.text:SetText(bar.prefix
+            .. format("%d%%", UnitPowerPercent(unit, 0, true, CurveConstants.ScaleTo100)))
+    else
+        bar.text:SetText(bar.name)  -- fill still shows the level
+    end
+end
+
+local function OnPowerEvent(bar, event, _, powerType)
+    -- Druids in forms also fire energy/rage events; skip non-mana.
+    -- Check secrecy first: comparing a secret would throw.
+    if powerType and not IsSecret(powerType) and powerType ~= "MANA" then
+        return
+    end
+    if event == "UNIT_MAXPOWER" then
+        bar.needMax = true
+    end
+
+    local now = GetTime()
+    local wait = UpdateRate() - (now - bar.lastUpdate)
+    if wait <= 0 then
+        bar.lastUpdate = now
+        pcall(UpdatePower, bar)
+    elseif not bar.pending then
+        bar.pending = true
+        C_Timer.After(wait, bar.flush)
+    end
+end
+
+------------------------------------------------------------------------
+-- Bar pool
 ------------------------------------------------------------------------
 
 local function GetBar(index)
-    if barPool[index] then return barPool[index] end
+    local bar = barPool[index]
+    if bar then return bar end
 
-    local bar = CreateFrame("StatusBar", nil, frame)
+    bar = CreateFrame("StatusBar", nil, frame)
     bar:SetStatusBarTexture(BarTexturePath())
 
     -- Dark background behind the bar
@@ -227,131 +359,35 @@ local function GetBar(index)
     text:SetWordWrap(false)
     bar.text = text
 
+    bar.lastUpdate = 0
+    -- Trailing redraw for the throttle. One closure per bar, made once.
+    bar.flush = function()
+        bar.pending = false
+        bar.lastUpdate = GetTime()
+        pcall(UpdatePower, bar)
+    end
+    bar:SetScript("OnEvent", OnPowerEvent)
+
     barPool[index] = bar
     return bar
 end
 
-local function ApplyTextureToAll()
-    local path = BarTexturePath()
-    for _, bar in ipairs(barPool) do
-        bar:SetStatusBarTexture(path)
+-- Point a bar's event subscriptions at a unit, or at nothing.
+local function BindBar(bar, unit)
+    if bar.unit == unit then return end
+    bar:UnregisterAllEvents()
+    bar.unit = unit
+    if not unit or not bar.RegisterUnitEvent then return end
+    -- FREQUENT gives smooth updates; fall back where it doesn't exist.
+    -- Registering an unknown event throws, hence the pcalls.
+    if not pcall(bar.RegisterUnitEvent, bar, "UNIT_POWER_FREQUENT", unit) then
+        pcall(bar.RegisterUnitEvent, bar, "UNIT_POWER_UPDATE", unit)
     end
-end
-
-local function HideAllBars()
-    for _, bar in ipairs(barPool) do
-        bar:Hide()
-    end
-end
-
-------------------------------------------------------------------------
--- Text helper — get "Name: XX%" text
---
--- Tier 1: UnitPower arithmetic (works if non-secret)
--- Tier 2: UnitPowerPercent + CurveConstants.ScaleTo100 (secret-safe)
---   The curve arg position differs between builds:
---     Form A: UnitPowerPercent(unit, powerType, curve)
---     Form B: UnitPowerPercent(unit, powerType, unmodified, curve)
---   The WRONG form can still succeed but silently return 0–1
---   instead of 0–100 (shows "1%" at full mana), and we can't
---   inspect a secret return to detect that. So we probe with the
---   PLAYER's own health — non-secret, comparable — to find which
---   form actually scales, then cache it.
--- Tier 3: Name only (bar fill shows proportion visually)
-------------------------------------------------------------------------
-
-local pctCallForm  -- "A", "B", or nil = undetermined (retry next call)
-
-local function DeterminePctCallForm()
-    if pctCallForm then return pctCallForm end
-    if not (UnitHealthPercent and CurveConstants and CurveConstants.ScaleTo100) then
-        return nil
-    end
-
-    -- Form A probe: UnitHealthPercent(unit, curve)
-    -- Player's own health is non-secret, so the > comparison is legal.
-    -- Health is virtually never below 1.5%, so scaled output > 1.5
-    -- reliably distinguishes 0–100 from 0–1.
-    local okA, scaledA = pcall(function()
-        return UnitHealthPercent("player", CurveConstants.ScaleTo100) > 1.5
-    end)
-    if okA and scaledA then
-        pctCallForm = "A"
-        return pctCallForm
-    end
-
-    -- Form B probe: UnitHealthPercent(unit, unmodified, curve)
-    local okB, scaledB = pcall(function()
-        return UnitHealthPercent("player", true, CurveConstants.ScaleTo100) > 1.5
-    end)
-    if okB and scaledB then
-        pctCallForm = "B"
-        return pctCallForm
-    end
-
-    return nil  -- undetermined; retry on a later call
-end
-
-local function GetPctText(unit, name)
-    -- Skip units that don't use mana (12.0.5+ API)
-    if UnitHasPowerType and not UnitHasPowerType(unit, 0) then
-        return name .. ": N/A"
-    end
-
-    -- Tier 1: full arithmetic (non-secret contexts)
-    local ok, text = pcall(function()
-        local power    = UnitPower(unit, 0)
-        local maxPower = UnitPowerMax(unit, 0)
-        local pct = 0
-        if maxPower > 0 then
-            pct = math.floor(power / maxPower * 100 + 0.5)
-        end
-        return string.format("%s: %d%%", name, pct)
-    end)
-    if ok then return text end
-
-    -- Tier 2: UnitPowerPercent with the probed, known-scaling form
-    if UnitPowerPercent and CurveConstants and CurveConstants.ScaleTo100 then
-        local form = DeterminePctCallForm()
-
-        if form == "A" then
-            local ok2, text2 = pcall(function()
-                local pct = UnitPowerPercent(unit, 0, CurveConstants.ScaleTo100)
-                return name .. ": " .. string.format("%d", pct) .. "%"
-            end)
-            if ok2 then return text2 end
-        elseif form == "B" then
-            local ok3, text3 = pcall(function()
-                local pct = UnitPowerPercent(unit, 0, true, CurveConstants.ScaleTo100)
-                return name .. ": " .. string.format("%d", pct) .. "%"
-            end)
-            if ok3 then return text3 end
-        end
-        -- form == nil: probe failed, don't risk showing a wrong scale
-    end
-
-    -- Tier 3: name only — bar fill shows proportion
-    return name
+    pcall(bar.RegisterUnitEvent, bar, "UNIT_MAXPOWER", unit)
 end
 
 ------------------------------------------------------------------------
--- Bar fill — secret-safe via StatusBar C-side math
---
--- Both SetMinMaxValues and SetValue accept secret numbers.
--- No Lua-side comparisons — everything is handled in C code.
-------------------------------------------------------------------------
-
-local function SetBarPower(bar, unit)
-    pcall(function()
-        local maxPower = UnitPowerMax(unit, 0)
-        local power    = UnitPower(unit, 0)
-        bar:SetMinMaxValues(0, maxPower)
-        bar:SetValue(power)
-    end)
-end
-
-------------------------------------------------------------------------
--- Roster scanning
+-- Roster scanning — runs only when the group changes
 --
 -- Midnight/retail (interface 12xxxx): track assigned HEALER roles.
 -- Forever (16001) and the Classic flavors (_Classic.toc): no reliable
@@ -360,24 +396,27 @@ end
 -- documented project constant — the MidnightStatus lesson).
 ------------------------------------------------------------------------
 
-local IS_FOREVER = (select(4, GetBuildInfo()) or 0) < 100000
+local NO_ROLES = (select(4, GetBuildInfo()) or 0) < 100000
 
-local MANA_CLASSES = {  -- fallback if the power query is blocked
+local MANA_CLASSES = {  -- covers members whose mana hasn't synced yet
     PRIEST = true, PALADIN = true, SHAMAN = true,
     DRUID = true, MAGE = true, WARLOCK = true, HUNTER = true,
 }
 
 local function TrackUnit(unit)
-    if IS_FOREVER then
-        -- No roles on Forever: anyone with a mana pool
-        local ok, hasMana = pcall(function()
-            return UnitPowerMax(unit, 0) > 0
-        end)
-        if ok then return hasMana end
+    if NO_ROLES then
+        local maxPower = UnitPowerMax(unit, 0)
+        if not IsSecret(maxPower) and maxPower > 0 then
+            return true
+        end
         local _, classFile = UnitClass(unit)
         return (classFile and MANA_CLASSES[classFile]) or false
     end
     return UnitGroupRolesAssigned(unit) == "HEALER"
+end
+
+local function ByName(a, b)
+    return (UnitName(a) or "") < (UnitName(b) or "")
 end
 
 local function ScanHealers()
@@ -395,40 +434,29 @@ local function ScanHealers()
     elseif IsInGroup() then
         for i = 1, GetNumGroupMembers() - 1 do
             local unit = "party" .. i
-            if UnitExists(unit)
-                and TrackUnit(unit) then
+            if UnitExists(unit) and TrackUnit(unit) then
                 healerUnits[#healerUnits + 1] = unit
             end
         end
     end
 
-    table.sort(healerUnits, function(a, b)
-        return (UnitName(a) or "") < (UnitName(b) or "")
-    end)
+    table.sort(healerUnits, ByName)
 end
 
 ------------------------------------------------------------------------
--- Rendering
+-- Layout — runs on roster change, settings change, Edit Mode enter /
+-- exit, and /rhm mouse. This is the only place bars are sized,
+-- anchored, styled, named, colored, shown or hidden.
 ------------------------------------------------------------------------
 
-local function GetClassColor(unit)
-    local _, classFile = UnitClass(unit)
-    if classFile then
-        local color = RAID_CLASS_COLORS[classFile]
-        if color then return color.r, color.g, color.b end
-    end
-    return MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
-end
-
-local function GetClassColorFromFile(classFile)
-    local color = RAID_CLASS_COLORS[classFile]
+local function ClassRGB(classFile)
+    local color = classFile and RAID_CLASS_COLORS[classFile]
     if color then return color.r, color.g, color.b end
     return MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
 end
 
--- Apply font with fallback — never hard-errors on a bad path.
--- Caches the applied font per fontstring to skip redundant SetFont
--- calls on every update tick (SetFont is not cheap).
+-- Apply font with fallback — never hard-errors on a bad path. Cached
+-- per fontstring so an unchanged font is never re-applied.
 local function SafeSetFont(fs)
     local path, size = FontPath(), FontSize()
     if fs.rhmFontPath == path and fs.rhmFontSize == size then
@@ -443,88 +471,81 @@ local function SafeSetFont(fs)
     fs.rhmFontSize = size
 end
 
-local function RenderBar(index, text, r, g, b, pctOverride)
-    local bw = BarWidth()
-    local bh = BarHeight()
-    local bar = GetBar(index)
-
-    bar:SetSize(bw, bh)
-    bar:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, -((index - 1) * (bh + GAP)))
-
-    SafeSetFont(bar.text)
-    bar.text:SetText(text)
-
-    -- Bar color
-    bar:SetStatusBarColor(r, g, b, 0.85)
-
-    -- If preview (pctOverride), set bar fill directly
-    if pctOverride then
-        bar:SetMinMaxValues(0, 100)
-        bar:SetValue(pctOverride)
-    end
-
-    bar:Show()
-end
-
-local function RefreshDisplay()
-    HideAllBars()
-
-    local bh = BarHeight()
-    local bw = BarWidth()
-
-    -- Edit Mode preview --------------------------------------------------
+local function Layout()
     local placing = IsInEditMode()
         or (db and db.mouse and not frame.__lemManaged)
-    if placing and #healerUnits == 0 then
-        local useClass = ClassColorsEnabled()
-        for i, data in ipairs(PREVIEW_DATA) do
-            local r, g, b = MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
-            if useClass then
-                r, g, b = GetClassColorFromFile(data.class)
-            end
-            RenderBar(i, string.format("%s: %d%%", data.name, data.pct), r, g, b, data.pct)
-        end
-        frame:SetSize(bw, #PREVIEW_DATA * (bh + GAP) - GAP)
-        frame:Show()
-        return
+    local preview = placing and #healerUnits == 0
+    local count = preview and #PREVIEW_DATA or #healerUnits
+
+    -- Release bars we won't use: hide them and drop their events
+    for i = count + 1, #barPool do
+        BindBar(barPool[i], nil)
+        barPool[i]:Hide()
     end
 
-    -- No healers ---------------------------------------------------------
-    if #healerUnits == 0 then
+    if count == 0 then
         frame:Hide()
         return
     end
 
-    -- Live data ----------------------------------------------------------
+    local bw, bh = BarWidth(), BarHeight()
+    local texture = BarTexturePath()
     local useClass = ClassColorsEnabled()
-    for i, unit in ipairs(healerUnits) do
-        if UnitExists(unit) then
+
+    for i = 1, count do
+        local bar = GetBar(i)
+        bar:SetSize(bw, bh)
+        bar:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, -((i - 1) * (bh + GAP)))
+        bar:SetStatusBarTexture(texture)
+        SafeSetFont(bar.text)
+        bar.lastPct = nil   -- whoever is in this slot may have changed
+        bar.needMax = true
+
+        local r, g, b = MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
+        if preview then
+            local data = PREVIEW_DATA[i]
+            BindBar(bar, nil)
+            if useClass then r, g, b = ClassRGB(data.class) end
+            bar:SetStatusBarColor(r, g, b, 0.85)
+            bar:SetMinMaxValues(0, 100)
+            bar:SetValue(data.pct)
+            bar.text:SetFormattedText("%s: %d%%", data.name, data.pct)
+        else
+            local unit = healerUnits[i]
             local name = UnitName(unit) or "?"
-            local text = GetPctText(unit, name)
-            local r, g, b = MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
+            bar.name = name
+            bar.prefix = name .. ": "
             if useClass then
-                r, g, b = GetClassColor(unit)
+                local _, classFile = UnitClass(unit)
+                r, g, b = ClassRGB(classFile)
             end
-            RenderBar(i, text, r, g, b)
-            -- Set bar fill from actual power (secret-safe)
-            SetBarPower(barPool[i], unit)
+            bar:SetStatusBarColor(r, g, b, 0.85)
+            BindBar(bar, unit)
+            bar.lastUpdate = GetTime()
+            pcall(UpdatePower, bar)  -- draw now; events take it from here
         end
+        bar:Show()
     end
 
-    frame:SetSize(bw, #healerUnits * (bh + GAP) - GAP)
+    frame:SetSize(bw, count * (bh + GAP) - GAP)
     frame:Show()
 end
 
-------------------------------------------------------------------------
--- Throttled OnUpdate
-------------------------------------------------------------------------
+-- GROUP_ROSTER_UPDATE arrives in bursts (raid joins, zone-ins);
+-- coalesce each burst into one scan + layout.
+local rosterPending = false
 
-frame:SetScript("OnUpdate", function(_, dt)
-    elapsed = elapsed + dt
-    if elapsed < UpdateRate() then return end
-    elapsed = 0
-    RefreshDisplay()
-end)
+local function FlushRoster()
+    rosterPending = false
+    ScanHealers()
+    Layout()
+end
+
+local function QueueRoster()
+    if rosterPending then return end
+    rosterPending = true
+    C_Timer.After(0.2, FlushRoster)
+end
 
 ------------------------------------------------------------------------
 -- Position — one shared spot, not per Edit Mode layout (same model as
@@ -605,11 +626,11 @@ local function SetupLEM()
 
     pcall(LEM.RegisterCallback, LEM, "enter", function()
         frame:EnableMouse(true)
-        pcall(RefreshDisplay)
+        pcall(Layout)
     end)
     pcall(LEM.RegisterCallback, LEM, "exit", function()
         ApplyMouse()
-        pcall(RefreshDisplay)
+        pcall(Layout)
     end)
 
     LEM:AddFrame(frame, function(_, _, point, x, y)
@@ -713,8 +734,7 @@ local function SetupLEM()
             get = function(layoutName) return textureIdx() end,
             set = function(layoutName, val)
                 db.barTexture = textureList[val].name
-                ApplyTextureToAll()
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -725,7 +745,7 @@ local function SetupLEM()
             get = function(layoutName) return barWIdx() end,
             set = function(layoutName, val)
                 db.barWidth = BAR_WIDTH_OPTIONS[val]
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -736,7 +756,7 @@ local function SetupLEM()
             get = function(layoutName) return barHIdx() end,
             set = function(layoutName, val)
                 db.barHeight = BAR_HEIGHT_OPTIONS[val]
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -747,7 +767,7 @@ local function SetupLEM()
             get = function(layoutName) return fontIdx() end,
             set = function(layoutName, val)
                 db.font = fontList[val].name
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -758,7 +778,7 @@ local function SetupLEM()
             get = function(layoutName) return sizeIdx() end,
             set = function(layoutName, val)
                 db.fontSize = FONT_SIZE_OPTIONS[val]
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -772,7 +792,7 @@ local function SetupLEM()
             get = function(layoutName) return ClassColorsEnabled() and 1 or 2 end,
             set = function(layoutName, val)
                 db.classColors = (val == 1)
-                RefreshDisplay()
+                Layout()
             end,
         },
         {
@@ -834,6 +854,9 @@ frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+-- Role swaps (retail). Guarded: registering an event a client doesn't
+-- have throws, and at file scope that would abort the whole load.
+pcall(frame.RegisterEvent, frame, "PLAYER_ROLES_ASSIGNED")
 
 frame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
@@ -871,9 +894,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
         Boot()
     end
 
-    if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-        ScanHealers()
-        RefreshDisplay()
+    if event == "PLAYER_ENTERING_WORLD" then
+        FlushRoster()  -- zone-in: unit tokens may have shifted, scan now
+    elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ROLES_ASSIGNED" then
+        QueueRoster()
     end
 end)
 
@@ -891,7 +915,7 @@ SlashCmdList["RHM"] = function(msg)
         db.mouse = false
         ApplyMouse()
         ApplyPos()
-        RefreshDisplay()
+        Layout()
         print("|cff00ccffRammsHealerMana|r — Settings reset to defaults.")
         return
     end
@@ -899,7 +923,7 @@ SlashCmdList["RHM"] = function(msg)
     if msg == "mouse" then
         db.mouse = not db.mouse
         ApplyMouse()
-        RefreshDisplay()
+        Layout()
         print("|cff00ccffRammsHealerMana|r — mouse " .. (db.mouse and "on" or "off"))
         return
     end

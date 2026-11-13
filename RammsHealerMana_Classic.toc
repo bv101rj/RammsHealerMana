@@ -2,7 +2,7 @@
 ## Title: RammsHealerMana
 ## Notes: Simple healer mana tracker with LibEditMode support
 ## Author: Ramm
-## Version: 1.3.1
+## Version: 1.4.0
 ## OptionalDeps: LibEditMode, LibSharedMedia-3.0
 ## SavedVariables: RammsHealerManaDB
 ## X-TOC: classic
