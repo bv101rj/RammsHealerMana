@@ -152,6 +152,9 @@ local frame = CreateFrame("Frame", "RammsHealerManaFrame", UIParent)
 frame:SetSize(160, 50)
 frame:SetPoint(DEFAULT_POSITION.point, DEFAULT_POSITION.x, DEFAULT_POSITION.y)
 frame:SetClampedToScreen(true)
+frame:SetMovable(true)
+frame:RegisterForDrag("LeftButton")
+frame:EnableMouse(false)  -- click-through unless /rhm mouse or Edit Mode
 
 ------------------------------------------------------------------------
 -- Helpers
@@ -350,11 +353,11 @@ end
 ------------------------------------------------------------------------
 -- Roster scanning
 --
--- Midnight/retail: track assigned HEALER roles.
--- Forever (interface 16001, mainline family, 1.60.x): there are no
+-- Midnight/retail (interface 12xxxx): track assigned HEALER roles.
+-- Forever (16001) and the Classic flavors (_Classic.toc): no reliable
 -- role assignments, so track every group member with a mana pool.
--- Flavor is detected by build number — Forever is the only sub-100000
--- client that can load this addon (the TOC lists no Classic flavors).
+-- Detected by interface number, not WOW_PROJECT_ID (Forever has no
+-- documented project constant — the MidnightStatus lesson).
 ------------------------------------------------------------------------
 
 local IS_FOREVER = (select(4, GetBuildInfo()) or 0) < 100000
@@ -470,7 +473,9 @@ local function RefreshDisplay()
     local bw = BarWidth()
 
     -- Edit Mode preview --------------------------------------------------
-    if IsInEditMode() and #healerUnits == 0 then
+    local placing = IsInEditMode()
+        or (db and db.mouse and not frame.__lemManaged)
+    if placing and #healerUnits == 0 then
         local useClass = ClassColorsEnabled()
         for i, data in ipairs(PREVIEW_DATA) do
             local r, g, b = MANA_COLOR.r, MANA_COLOR.g, MANA_COLOR.b
@@ -522,76 +527,100 @@ frame:SetScript("OnUpdate", function(_, dt)
 end)
 
 ------------------------------------------------------------------------
--- Drag fallback — used only when LibEditMode is unavailable or its
--- setup fails, so the frame is never stuck unmovable.
+-- Position — one shared spot, not per Edit Mode layout (same model as
+-- MidnightStatus). Edit Mode layouts follow spec, so per-layout storage
+-- made the frame jump around on spec swap.
 ------------------------------------------------------------------------
 
-local function EnableDragFallback()
-    frame:SetMovable(true)
-    frame:EnableMouse(true)
-    frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", frame.StartMoving)
-    frame:SetScript("OnDragStop", function(f)
-        f:StopMovingOrSizing()
-        local point, _, _, x, y = f:GetPoint()
-        if point then
-            db.dragPosition = { point = point, x = x, y = y }
-        end
-    end)
-    local pos = db.dragPosition
-    if type(pos) == "table"
-        and type(pos.point) == "string"
-        and type(pos.x) == "number"
-        and type(pos.y) == "number" then
-        frame:ClearAllPoints()
-        frame:SetPoint(pos.point, pos.x, pos.y)
+-- Set while we place the frame ourselves, so a position callback that
+-- LibEditMode fires in response to our own SetPoint can't overwrite the
+-- store with a value it just handed us.
+local applyingPos = false
+
+local function GetPos()
+    local p = db.position
+    if type(p) ~= "table"
+        or type(p.point) ~= "string"
+        or type(p.x) ~= "number"
+        or type(p.y) ~= "number" then
+        p = CopyTable(DEFAULT_POSITION)
+        db.position = p
     end
-    print("|cff00ccffRammsHealerMana|r — Edit Mode unavailable; drag the frame to move it.")
+    return p
 end
 
+local function SetPos(point, x, y)
+    if applyingPos or type(point) ~= "string" then
+        return
+    end
+    db.position = { point = point, x = x or 0, y = y or 0 }
+end
+
+local function ApplyPos()
+    local p = GetPos()
+    applyingPos = true
+    frame:ClearAllPoints()
+    frame:SetPoint(p.point, UIParent, p.point, p.x, p.y)
+    applyingPos = false
+end
+
+local function ApplyMouse()
+    frame:EnableMouse(db.mouse and true or false)
+end
+
+-- Plain drag only when LibEditMode isn't managing the frame
+frame:SetScript("OnDragStart", function(self)
+    if not self.__lemManaged then
+        self:StartMoving()
+    end
+end)
+
+frame:SetScript("OnDragStop", function(self)
+    if not self.__lemManaged then
+        self:StopMovingOrSizing()
+        local point, _, _, x, y = self:GetPoint(1)
+        SetPos(point, x, y)
+    end
+end)
+
 ------------------------------------------------------------------------
--- LibEditMode integration (embedded under Libs\LibEditMode)
+-- LibEditMode glue (optional — loaded by any addon that ships it)
 -- Field names verified against working RammsRuneforge code:
 --   kind, values, get(layoutName), set(layoutName, value)
 ------------------------------------------------------------------------
 
 local function SetupLEM()
-    LEM = LibStub and LibStub("LibEditMode", true)
-    if not LEM then
-        EnableDragFallback()
+    if not LibStub then
         return
     end
-
-    local function OnPositionChanged(f, layoutName, point, x, y)
-        pcall(function()
-            db.layouts[layoutName] = { point = point, x = x, y = y }
-        end)
+    local ok, lib = pcall(LibStub, "LibEditMode", true)
+    if not ok or not lib then
+        return
     end
+    LEM = lib
 
-    LEM:AddFrame(frame, OnPositionChanged, DEFAULT_POSITION)
-
-    LEM:RegisterCallback("layout", function(layoutName)
-        pcall(function()
-            local pos = db.layouts[layoutName]
-            -- Guard against malformed entries from older DB versions
-            if type(pos) ~= "table"
-                or type(pos.point) ~= "string"
-                or type(pos.x) ~= "number"
-                or type(pos.y) ~= "number" then
-                pos = CopyTable(DEFAULT_POSITION)
-                db.layouts[layoutName] = pos
-            end
-            frame:ClearAllPoints()
-            frame:SetPoint(pos.point, pos.x, pos.y)
-        end)
+    LEM:RegisterCallback("layout", function()
+        ApplyPos()
     end)
 
-    LEM:RegisterCallback("enter", function()
+    pcall(LEM.RegisterCallback, LEM, "enter", function()
+        frame:EnableMouse(true)
         pcall(RefreshDisplay)
     end)
-    LEM:RegisterCallback("exit", function()
+    pcall(LEM.RegisterCallback, LEM, "exit", function()
+        ApplyMouse()
         pcall(RefreshDisplay)
     end)
+
+    LEM:AddFrame(frame, function(_, _, point, x, y)
+        SetPos(point, x, y)
+    end, DEFAULT_POSITION)
+
+    frame.__lemManaged = true
+
+    if not (LEM.AddFrameSettings and LEM.SettingType) then
+        return
+    end
 
     -- Build option value tables from LSM or built-in lists
     local fontList = GetFontList()
@@ -675,7 +704,7 @@ local function SetupLEM()
         return 2
     end
 
-    LEM:AddFrameSettings(frame, {
+    pcall(LEM.AddFrameSettings, LEM, frame, {
         {
             name    = "Bar Texture",
             kind    = LEM.SettingType.Dropdown,
@@ -763,7 +792,46 @@ end
 -- Events
 ------------------------------------------------------------------------
 
+-- Pull any older per-layout (db.layouts) or drag (db.dragPosition)
+-- position into the single shared slot, then drop the old keys.
+local function MigratePosition()
+    if type(db.position) ~= "table" then
+        local src = db.dragPosition
+        if type(src) ~= "table" and type(db.layouts) == "table" then
+            for _, v in pairs(db.layouts) do
+                if type(v) == "table" and type(v.point) == "string" then
+                    src = v
+                    break
+                end
+            end
+        end
+        if type(src) == "table" and type(src.point) == "string" then
+            db.position = {
+                point = src.point,
+                x = tonumber(src.x) or 0,
+                y = tonumber(src.y) or 0,
+            }
+        end
+    end
+    db.layouts = nil
+    db.dragPosition = nil
+end
+
+local booted = false
+
+-- Runs once at login, after every addon has loaded, so a LibEditMode or
+-- LibSharedMedia shipped inside some other addon is already registered.
+local function Boot()
+    LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
+    ApplyMouse()
+    pcall(SetupLEM)
+    if not frame.__lemManaged then
+        ApplyPos()
+    end
+end
+
 frame:RegisterEvent("ADDON_LOADED")
+frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 
@@ -780,7 +848,6 @@ frame:SetScript("OnEvent", function(_, event, ...)
         for k, v in pairs(defaults) do
             if db[k] == nil then db[k] = v end
         end
-        if type(db.layouts) ~= "table" then db.layouts = {} end
 
         -- Sanitize types (protects against mixed-version SavedVariables)
         if type(db.font) ~= "string" then db.font = defaults.font end
@@ -790,23 +857,21 @@ frame:SetScript("OnEvent", function(_, event, ...)
         if type(db.barWidth) ~= "number" then db.barWidth = defaults.barWidth end
         if type(db.updateRate) ~= "number" then db.updateRate = defaults.updateRate end
         if type(db.classColors) ~= "boolean" then db.classColors = defaults.classColors end
+        if db.mouse == nil then db.mouse = false end
 
-        -- Initialize LibSharedMedia (optional)
-        LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
-
-        -- If LEM setup errors (client without Edit Mode, lib failure),
-        -- fall back to a draggable frame instead of dying.
-        local okLEM = pcall(SetupLEM)
-        if not okLEM then
-            LEM = nil
-            pcall(EnableDragFallback)
-        end
-        ScanHealers()
-        RefreshDisplay()
+        MigratePosition()
+        ApplyPos()
 
         frame:UnregisterEvent("ADDON_LOADED")
+        return
+    end
 
-    elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+    if (event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD") and not booted then
+        booted = true
+        Boot()
+    end
+
+    if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
         ScanHealers()
         RefreshDisplay()
     end
@@ -823,14 +888,23 @@ SlashCmdList["RHM"] = function(msg)
         RammsHealerManaDB = {}
         db = RammsHealerManaDB
         for k, v in pairs(defaults) do db[k] = v end
-        db.layouts = {}
-        frame:ClearAllPoints()
-        frame:SetPoint(DEFAULT_POSITION.point, DEFAULT_POSITION.x, DEFAULT_POSITION.y)
+        db.mouse = false
+        ApplyMouse()
+        ApplyPos()
         RefreshDisplay()
         print("|cff00ccffRammsHealerMana|r — Settings reset to defaults.")
         return
     end
 
+    if msg == "mouse" then
+        db.mouse = not db.mouse
+        ApplyMouse()
+        RefreshDisplay()
+        print("|cff00ccffRammsHealerMana|r — mouse " .. (db.mouse and "on" or "off"))
+        return
+    end
+
     print("|cff00ccffRammsHealerMana|r — Select the frame in Edit Mode to configure.")
+    print("  |cffffcc00/rhm mouse|r — Toggle drag-to-move (no Edit Mode needed).")
     print("  |cffffcc00/rhm reset|r — Reset all settings to defaults.")
 end
